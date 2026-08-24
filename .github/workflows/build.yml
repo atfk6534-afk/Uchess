@@ -52,6 +52,10 @@ jobs:
         working-directory: ${{ steps.locate.outputs.project_dir }}
         run: flutter pub get
 
+      - name: Make gradlew executable
+        working-directory: ${{ steps.locate.outputs.project_dir }}/android
+        run: chmod +x gradlew
+
       - name: Analyze
         working-directory: ${{ steps.locate.outputs.project_dir }}
         run: flutter analyze --fatal-infos
