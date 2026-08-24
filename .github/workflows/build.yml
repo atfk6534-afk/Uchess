@@ -1,0 +1,140 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unzip project if a zip was uploaded
+        run: |
+          ZIP_FILE=$(find . -maxdepth 2 -iname "*.zip" | head -n 1)
+          if [ -n "$ZIP_FILE" ]; then
+            echo "Found zip: $ZIP_FILE — extracting..."
+            unzip -o -q "$ZIP_FILE" -d extracted
+          else
+            echo "No zip found — assuming project files were uploaded unzipped."
+          fi
+
+      - name: Find the Flutter project folder
+        id: locate
+        run: |
+          PUBSPEC=$(find . -maxdepth 6 -iname "pubspec.yaml" -not -path "*/node_modules/*" | head -n 1)
+          if [ -z "$PUBSPEC" ]; then
+            echo "Could not find pubspec.yaml anywhere in the repo (searched 6 levels deep)."
+            echo "Make sure the project (or its zip) was actually uploaded to GitHub."
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$PUBSPEC")
+          echo "Found project at: $PROJECT_DIR"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.0'
+          channel: 'stable'
+          cache: true
+
+      - name: Install dependencies
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: flutter analyze --fatal-infos
+
+      - name: Run tests
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: flutter test
+
+      - name: Build release APK
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: chess-coach-apk
+          path: ${{ steps.locate.outputs.project_dir }}/build/app/outputs/flutter-apk/app-release.apk
+
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unzip project if a zip was uploaded
+        run: |
+          ZIP_FILE=$(find . -maxdepth 2 -iname "*.zip" | head -n 1)
+          if [ -n "$ZIP_FILE" ]; then
+            echo "Found zip: $ZIP_FILE — extracting..."
+            unzip -o -q "$ZIP_FILE" -d extracted
+          else
+            echo "No zip found — assuming project files were uploaded unzipped."
+          fi
+
+      - name: Find the server folder
+        id: locate
+        run: |
+          PKG=$(find . -maxdepth 7 -iname "package.json" -not -path "*/node_modules/*" | xargs grep -l "chess-coach-server" 2>/dev/null | head -n 1)
+          if [ -z "$PKG" ]; then
+            echo "Could not find the server's package.json (chess-coach-server) anywhere in the repo."
+            exit 1
+          fi
+          SERVER_DIR=$(dirname "$PKG")
+          echo "Found server at: $SERVER_DIR"
+          echo "server_dir=$SERVER_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Stockfish (for real integration tests)
+        run: sudo apt-get update && sudo apt-get install -y stockfish
+
+      - name: Install dependencies
+        working-directory: ${{ steps.locate.outputs.server_dir }}
+        run: npm install
+
+      - name: Run tests
+        working-directory: ${{ steps.locate.outputs.server_dir }}
+        run: npm test
+        env:
+          STOCKFISH_PATH: /usr/games/stockfish
+
+      - name: Build Docker image
+        working-directory: ${{ steps.locate.outputs.server_dir }}
+        run: docker build -t chess-coach-server:ci .
+
+      - name: Smoke-test the container
+        working-directory: ${{ steps.locate.outputs.server_dir }}
+        run: |
+          docker run -d --name chess-coach-test -p 8080:8080 chess-coach-server:ci
+          for i in $(seq 1 15); do
+            if curl -sf http://localhost:8080/api/health; then
+              echo "Health check passed"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Container never became healthy"
+          docker logs chess-coach-test
+          exit 1
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f chess-coach-test || true
